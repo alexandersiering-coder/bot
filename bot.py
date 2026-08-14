@@ -45,7 +45,10 @@ NAME_TRIGGER_RE = re.compile(rf"\b{re.escape(NAME_TRIGGER)}\b", re.IGNORECASE)
 # (praktisch für lokale Entwicklung).
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # optional, zusätzliche Absicherung
+# Telegram erlaubt für secret_token nur A-Z a-z 0-9 _ - (1-256 Zeichen);
+# Renders generateValue liefert auch andere Zeichen, deshalb hier bereinigen.
+_raw_webhook_secret = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = re.sub(r"[^A-Za-z0-9_-]", "", _raw_webhook_secret)[:256] or None
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
