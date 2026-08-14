@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: alesie-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: LLM_MODEL
+        value: llama-3.3-70b-versatile
+      - key: SYSTEM_PROMPT
+        value: Du bist ein hilfsbereiter Assistent in einem Telegram-Chat. Antworte knapp und in der Sprache des Nutzers.
+      - key: HISTORY_TURNS
+        value: "10"
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: BOT_NAME_TRIGGER
+        value: Kollege
+      - key: WEBHOOK_SECRET
+        generateValue: true

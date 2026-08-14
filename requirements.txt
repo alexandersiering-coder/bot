@@ -1,0 +1,3 @@
+python-telegram-bot[rate-limiter,webhooks]>=21.9
+openai>=1.60
+python-dotenv>=1.0
