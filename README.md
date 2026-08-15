@@ -42,10 +42,34 @@ Alles andere (normaler Text) geht ans Modell.
 | `BOT_NAME_TRIGGER` | Name, auf den der Bot in Gruppen zusätzlich reagiert (Default `Kollege`) |
 | `WEBHOOK_URL`      | Nur für Deployment (s.u.). Lokal leer lassen → Bot läuft per Polling |
 | `WEBHOOK_SECRET`   | Optional, zusätzliche Absicherung des Webhooks (s.u.)             |
+| `BRING_MCP_URL`    | Optional, s. u. „Bring!-Einkaufsliste"                            |
+| `BRING_MCP_TOKEN`  | Optional, s. u. „Bring!-Einkaufsliste"                            |
 
 In Gruppen antwortet der Bot nur, wenn er per `@alesie_bot` erwähnt wird, auf
 seine eigene Nachricht geantwortet wird, oder `BOT_NAME_TRIGGER` im Text
 vorkommt. Im privaten 1:1-Chat antwortet er auf alles.
+
+## Bring!-Einkaufsliste
+
+Wenn `BRING_MCP_URL` und `BRING_MCP_TOKEN` gesetzt sind, kann der Bot die
+Bring!-Einkaufsliste per natürlicher Sprache lesen und schreiben ("Kollege,
+setz Milch auf die Liste", "was steht noch auf der Liste?", "hak Butter ab").
+Das Modell entscheidet selbst per Function Calling, wann es die Liste liest
+oder ändert — dafür braucht `LLM_MODEL` Tool-Use-Unterstützung (bei Groq z. B.
+`llama-3.3-70b-versatile`, der Default hier).
+
+Die eigentliche Bring!-Anbindung läuft nicht in diesem Bot, sondern im
+separaten `geteilte einkaufsliste`-Projekt (Bring-MCP-Server auf Render).
+Dessen URL + Token (aus dessen Render-Dashboard, `MCP_AUTH_TOKEN`) hier
+eintragen:
+
+```
+BRING_MCP_URL=https://<dein-bring-mcp-service>.onrender.com/mcp
+BRING_MCP_TOKEN=<dasselbe Token wie im Bring-MCP-Server>
+```
+
+Ohne beide Variablen bleibt das Feature einfach aus, der Bot verhält sich wie
+zuvor.
 
 ## Hinweise
 

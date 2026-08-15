@@ -1,12 +1,15 @@
 """Telegram-Chatbot mit LLM-Anbindung (Groq / Gemini / OpenAI-kompatibel)."""
 
 import asyncio
+import json
 import logging
 import os
 import re
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ChatAction
@@ -49,6 +52,121 @@ PORT = int(os.getenv("PORT", "10000"))
 # Renders generateValue liefert auch andere Zeichen, deshalb hier bereinigen.
 _raw_webhook_secret = os.getenv("WEBHOOK_SECRET", "")
 WEBHOOK_SECRET = re.sub(r"[^A-Za-z0-9_-]", "", _raw_webhook_secret)[:256] or None
+
+# Bring!-Einkaufsliste über den separat deployten Bring-MCP-Server.
+BRING_MCP_URL = os.getenv("BRING_MCP_URL")
+BRING_MCP_TOKEN = os.getenv("BRING_MCP_TOKEN")
+BRING_ENABLED = bool(BRING_MCP_URL and BRING_MCP_TOKEN)
+
+if BRING_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n\nDu hast über Functions Zugriff auf die Bring!-Einkaufsliste "
+        "(list_shopping_lists, get_list_items, add_items, complete_items, "
+        "remove_items). Nutze sie, wenn im Chat nach der Einkaufsliste "
+        "gefragt wird oder etwas hinzugefügt, abgehakt oder entfernt "
+        "werden soll. Frag nicht extra nach, ruf die Funktion direkt auf."
+    )
+
+BRING_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_shopping_lists",
+            "description": "Zeigt alle Bring!-Einkaufslisten mit Namen an.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_list_items",
+            "description": "Liest offene und erledigte Artikel einer Bring!-Einkaufsliste.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "list_name": {
+                        "type": "string",
+                        "description": "Name der Liste. Ohne Angabe wird die erste Liste verwendet.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_items",
+            "description": (
+                "Setzt einen oder mehrere Artikel auf eine Bring!-Einkaufsliste. "
+                "Für Mengen-/Sortenangaben 'Artikel: Angabe' nutzen, "
+                "z. B. 'Milch: 2 Liter'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Artikel, die hinzugefügt werden sollen.",
+                    },
+                    "list_name": {
+                        "type": "string",
+                        "description": "Name der Liste. Ohne Angabe wird die erste Liste verwendet.",
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_items",
+            "description": "Hakt Artikel auf einer Bring!-Einkaufsliste als gekauft ab.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Namen der Artikel, die abgehakt werden sollen.",
+                    },
+                    "list_name": {
+                        "type": "string",
+                        "description": "Name der Liste. Ohne Angabe wird die erste Liste verwendet.",
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_items",
+            "description": (
+                "Entfernt Artikel vollständig von einer Bring!-Einkaufsliste "
+                "(anders als complete_items landen sie nicht bei erledigt, "
+                "sondern verschwinden ganz)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Namen der Artikel, die entfernt werden sollen.",
+                    },
+                    "list_name": {
+                        "type": "string",
+                        "description": "Name der Liste. Ohne Angabe wird die erste Liste verwendet.",
+                    },
+                },
+                "required": ["items"],
+            },
+        },
+    },
+]
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -96,6 +214,21 @@ async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"Modell: {MODEL}\nEndpoint: {BASE_URL}")
 
 
+async def call_bring_tool(name: str, arguments: dict) -> str:
+    """Ruft ein Tool auf dem Bring-MCP-Server auf und gibt das Ergebnis als Text zurück."""
+    async with streamablehttp_client(
+        BRING_MCP_URL, headers={"Authorization": f"Bearer {BRING_MCP_TOKEN}"}
+    ) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(name, arguments)
+            parts = [block.text for block in result.content if hasattr(block, "text")]
+            text = "\n".join(parts) if parts else str(result.content)
+            if result.isError:
+                raise RuntimeError(text)
+            return text
+
+
 def directly_addressed(update: Update, bot_username: str) -> bool:
     """In Gruppen: nur bei @mention, Reply auf eine Bot-Nachricht oder Namensnennung reagieren."""
     message = update.message
@@ -131,16 +264,38 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # an; der Name hilft dem Modell, Sprecher auseinanderzuhalten.
     prompt_text = f"{sender}: {user_text}" if is_group else user_text
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *convo,
+                {"role": "user", "content": prompt_text}]
+    llm_kwargs = {"tools": BRING_TOOLS, "tool_choice": "auto"} if BRING_ENABLED else {}
+
     typing = asyncio.create_task(keep_typing(context, chat_id))
     try:
-        response = await client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, *convo,
-                      {"role": "user", "content": prompt_text}],
-            temperature=0.7,
-            max_tokens=1024,
-        )
-        answer = response.choices[0].message.content.strip()
+        answer = None
+        for _ in range(5):  # begrenzt, damit sich das Modell nicht endlos in Tool-Calls verrennt
+            response = await client.chat.completions.create(
+                model=MODEL, messages=messages, temperature=0.7, max_tokens=1024, **llm_kwargs
+            )
+            msg = response.choices[0].message
+            if not msg.tool_calls:
+                answer = (msg.content or "").strip()
+                break
+
+            messages.append(msg.model_dump(exclude_none=True))
+            for tool_call in msg.tool_calls:
+                args = json.loads(tool_call.function.arguments or "{}")
+                try:
+                    result = await call_bring_tool(tool_call.function.name, args)
+                except Exception as err:
+                    log.warning("Bring-Tool-Call fehlgeschlagen: %s", err)
+                    result = f"Fehler: {err}"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                })
+
+        if answer is None:
+            answer = "Ich komme gerade zu keinem Ergebnis, versuch's nochmal."
     except Exception:
         log.exception("LLM-Aufruf fehlgeschlagen")
         await update.message.reply_text("Da ist beim Modell etwas schiefgelaufen. Nochmal versuchen?")

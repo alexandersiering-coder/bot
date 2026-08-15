@@ -24,3 +24,7 @@ services:
         value: Kollege
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: BRING_MCP_URL
+        sync: false
+      - key: BRING_MCP_TOKEN
+        sync: false
