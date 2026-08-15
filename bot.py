@@ -550,7 +550,7 @@ def _build_help_text() -> str:
     parts += [
         "",
         "Befehle:",
-        "/reset – Gesprächsverlauf löschen",
+        "/reset – Gesprächsverlauf löschen (in Themen nur das aktuelle)",
         "/model – aktuelles Modell anzeigen",
         "/help – diese Übersicht",
     ]
@@ -567,10 +567,13 @@ log = logging.getLogger("bot")
 
 client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-# chat_id -> letzte Nachrichten
-history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
+# (chat_id, thread_id) -> letzte Nachrichten. Jedes Thema einer Forum-Gruppe
+# ist ein eigenes Gespräch, sonst würde sich der Kontext vermischen.
+history: dict[tuple[int, int | None], deque] = defaultdict(
+    lambda: deque(maxlen=HISTORY_TURNS * 2)
+)
 
-# chat_id -> unadressierte Gruppennachrichten seit der letzten proaktiven
+# unadressierte Gruppennachrichten seit der letzten proaktiven
 # Prüfung (nur befüllt, wenn PROACTIVE_ENABLED).
 # Schlüssel: (chat_id, thread_id) — in Forum-Gruppen ist jedes Thema ein
 # eigenes Gespräch, der Vorschlag soll dort landen, wo er entstanden ist.
@@ -621,8 +624,11 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         await deny(update)
         return
-    history.pop(update.effective_chat.id, None)
-    await update.message.reply_text("Verlauf gelöscht.")
+    thread_id = thread_id_of(update.message)
+    history.pop((update.effective_chat.id, thread_id), None)
+    await update.message.reply_text(
+        "Verlauf für dieses Thema gelöscht." if thread_id else "Verlauf gelöscht."
+    )
 
 
 async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -755,7 +761,7 @@ async def ask_llm(chat_id: int, content, *, thread_id: int | None = None,
     if storage.REMINDERS_ENABLED:
         system_content += f"\n\nAktuelles Datum/Uhrzeit: {storage.now_local_label()}."
 
-    convo = history[chat_id]
+    convo = history[(chat_id, thread_id)]
     messages = [{"role": "system", "content": system_content}, *convo,
                 {"role": "user", "content": content}]
     llm_kwargs = {"tools": ALL_TOOLS, "tool_choice": "auto"} if (use_tools and ALL_TOOLS) else {}
@@ -813,7 +819,7 @@ async def reply_with_llm(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     finally:
         typing.cancel()
 
-    convo = history[chat_id]
+    convo = history[(chat_id, thread_id)]
     convo.append({"role": "user", "content": history_text})
     convo.append({"role": "assistant", "content": answer})
 
@@ -1148,7 +1154,9 @@ async def check_proactive_suggestions(context: ContextTypes.DEFAULT_TYPE) -> Non
             await send_to(context, chat_id, thread_id, suggestion)
             # Im Verlauf merken, damit eine Antwort wie "ja mach" später
             # weiß, worauf sie sich bezieht.
-            history[chat_id].append({"role": "assistant", "content": suggestion})
+            history[(chat_id, thread_id)].append(
+                {"role": "assistant", "content": suggestion}
+            )
 
 
 async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

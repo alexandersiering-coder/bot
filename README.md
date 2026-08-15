@@ -23,7 +23,7 @@ Beenden mit Strg+C. Danach in Telegram `@alesie_bot` anschreiben.
 | -------- | ----------------------------- |
 | `/start` | Begrüßung + Hilfe             |
 | `/help`  | dasselbe                      |
-| `/reset` | Gesprächsverlauf des Chats löschen |
+| `/reset` | Gesprächsverlauf löschen (in Forum-Gruppen nur das aktuelle Thema) |
 | `/model` | aktuelles Modell + Endpoint    |
 
 Alles andere (normaler Text) geht ans Modell.
@@ -280,7 +280,12 @@ Mitgliedern Zugriff auf Kalender und Liste geben willst.
 ## Gruppen mit Themen (Forum)
 
 Hat eine Gruppe Themen aktiviert, antwortet der Bot immer im Thema, in dem er
-angesprochen wurde. Auch **zeitgesteuerte** Nachrichten landen dort, wo sie
+angesprochen wurde. Jedes Thema ist dabei ein **eigenes Gespräch**: der
+Verlauf wird pro Thema geführt, sodass sich Kontext nicht zwischen „Einkauf"
+und „Urlaub" vermischt. `/reset` löscht entsprechend nur den Verlauf des
+Themas, in dem es aufgerufen wird.
+
+Auch **zeitgesteuerte** Nachrichten landen dort, wo sie
 eingerichtet wurden: Erinnerungen merken sich das Thema beim Anlegen
 (`reminders.thread_id`), Kalender-Hinweise das Thema der letzten
 Abo-Einstellung (`calendar_subs.thread_id`). Proaktive Vorschläge werden pro
