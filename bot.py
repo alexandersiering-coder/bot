@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from mcp import ClientSession
@@ -31,6 +32,7 @@ load_dotenv()
 # RECIPE_API_KEY) beim Import auf Modulebene, sonst sähen sie ggf. noch die
 # Umgebung von vor dem .env-Laden (betrifft lokale Entwicklung; auf Render
 # stehen die Vars ohnehin schon im Prozess-Environment).
+import gcal
 import recipes
 import storage
 
@@ -111,6 +113,44 @@ if storage.REMINDERS_ENABLED:
             "Rezept-API (mit Zutatenliste), Wiederholungen werden vermieden "
             "— 'text' dient dabei nur als kurze Beschriftung der Erinnerung."
         )
+
+if gcal.CALENDAR_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n\nDu hast über Functions Zugriff auf den Google-Kalender "
+        "(list_calendar_events, create_calendar_event, delete_calendar_event). "
+        "Nutze den Kalender für echte Termine mit Datum/Uhrzeit, die im "
+        "Kalender stehen sollen ('trag Zahnarzt Montag 10 Uhr ein', 'was "
+        "steht diese Woche an?'). Für reine Ping-Erinnerungen ohne "
+        "Kalendereintrag nimm weiterhin create_reminder. Termin-IDs zum "
+        "Löschen bekommst du über list_calendar_events."
+    )
+    if storage.REMINDERS_ENABLED:
+        SYSTEM_PROMPT += (
+            " Mit set_calendar_notifications stellst du ein, ob dieser Chat "
+            "morgens einen Tagesüberblick bekommt und wie viele Minuten vor "
+            "einem Termin vorab erinnert wird."
+        )
+
+# Proaktive Vorschläge in Gruppen ("Soll ich das auf die Liste setzen?"):
+# 0 = aus. Braucht mindestens Bring oder Reminders, sonst gäbe es nichts
+# vorzuschlagen.
+PROACTIVE_INTERVAL_HOURS = float(os.getenv("PROACTIVE_INTERVAL_HOURS", "0"))
+PROACTIVE_ENABLED = PROACTIVE_INTERVAL_HOURS > 0 and (
+    BRING_ENABLED or storage.REMINDERS_ENABLED or gcal.CALENDAR_ENABLED
+)
+
+
+def _proactive_targets_text() -> str:
+    targets = []
+    if BRING_ENABLED:
+        targets.append("die Einkaufsliste")
+    if storage.REMINDERS_ENABLED:
+        targets.append("eine Erinnerung")
+        targets.append("eine Notiz/ein Todo")
+    if gcal.CALENDAR_ENABLED:
+        targets.append("einen Kalendertermin")
+    return ", ".join(targets[:-1]) + " oder " + targets[-1] if len(targets) > 1 else targets[0]
+
 
 BRING_TOOLS = [
     {
@@ -306,9 +346,181 @@ REMINDER_TOOLS = [
     },
 ]
 
-ALL_TOOLS = (BRING_TOOLS if BRING_ENABLED else []) + (REMINDER_TOOLS if storage.REMINDERS_ENABLED else [])
+CALENDAR_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_calendar_events",
+            "description": (
+                "Liest Termine aus dem Google-Kalender. Ohne Angaben die "
+                "nächsten 7 Tage ab jetzt."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {
+                        "type": "string",
+                        "description": "Beginn des Zeitraums als ISO-Datum oder -Datetime, z. B. '2026-08-16'.",
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Ende des Zeitraums. Reines Datum schließt den ganzen Tag ein.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_calendar_event",
+            "description": "Trägt einen Termin in den Google-Kalender ein.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Titel des Termins."},
+                    "start": {
+                        "type": "string",
+                        "description": "Beginn als ISO-8601 ohne Zeitzone, z. B. '2026-08-16T10:00'.",
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Ende. Ohne Angabe dauert der Termin eine Stunde.",
+                    },
+                    "description": {"type": "string"},
+                    "location": {"type": "string", "description": "Ort des Termins."},
+                    "all_day": {
+                        "type": "boolean",
+                        "description": "true für ganztägige Termine; start/end dann als reines Datum.",
+                    },
+                },
+                "required": ["title", "start"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_calendar_event",
+            "description": "Löscht einen Termin anhand seiner ID (siehe list_calendar_events).",
+            "parameters": {
+                "type": "object",
+                "properties": {"event_id": {"type": "string"}},
+                "required": ["event_id"],
+            },
+        },
+    },
+]
+
+CALENDAR_NOTIFY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "set_calendar_notifications",
+        "description": (
+            "Stellt ein, wie dieser Chat über Kalendertermine informiert wird: "
+            "täglicher Überblick am Morgen und/oder Vorab-Hinweis kurz vor "
+            "einem Termin."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "briefing_time": {
+                    "type": "string",
+                    "description": "Uhrzeit des Tagesüberblicks als 'HH:MM', oder 'off' zum Abschalten.",
+                },
+                "lead_minutes": {
+                    "type": "integer",
+                    "description": "Minuten vor einem Termin für den Vorab-Hinweis. 0 schaltet ab.",
+                },
+            },
+        },
+    },
+}
+
+CALENDAR_ENABLED_TOOLS = []
+if gcal.CALENDAR_ENABLED:
+    CALENDAR_ENABLED_TOOLS = list(CALENDAR_TOOLS)
+    if storage.REMINDERS_ENABLED:  # Abo-Einstellungen brauchen die Datenbank
+        CALENDAR_ENABLED_TOOLS.append(CALENDAR_NOTIFY_TOOL)
+
+ALL_TOOLS = (
+    (BRING_TOOLS if BRING_ENABLED else [])
+    + (REMINDER_TOOLS if storage.REMINDERS_ENABLED else [])
+    + CALENDAR_ENABLED_TOOLS
+)
 BRING_TOOL_NAMES = {t["function"]["name"] for t in BRING_TOOLS}
 REMINDER_TOOL_NAMES = {t["function"]["name"] for t in REMINDER_TOOLS}
+CALENDAR_TOOL_NAMES = {t["function"]["name"] for t in CALENDAR_TOOLS} | {
+    CALENDAR_NOTIFY_TOOL["function"]["name"]
+}
+
+
+def _build_help_text() -> str:
+    """Kurzanleitung für /start und /help — passt sich an, welche optionalen
+    Features (Bring, Erinnerungen, Rezeptideen) gerade aktiv sind."""
+    parts = [
+        "Hi! Ich bin dein Assistent hier in Telegram. Schreib mir einfach "
+        "etwas — für Fragen, Texte, Erklärungen und mehr.",
+        "",
+        f"In Gruppen antworte ich nur, wenn du mich per @-Erwähnung ansprichst, "
+        f"'{NAME_TRIGGER}' sagst, oder auf meine Nachricht antwortest. Im "
+        "privaten Chat reagiere ich auf alles.",
+        "",
+        "🖼 Bilder & 📄 PDFs: einfach als Foto oder Dokument schicken, ich "
+        "lese bzw. beschreibe den Inhalt.",
+    ]
+    if BRING_ENABLED:
+        parts += [
+            "",
+            "🛒 Einkaufsliste: \"setz Milch auf die Liste\", \"was steht noch "
+            "drauf?\", \"hak Butter ab\"",
+        ]
+    if storage.REMINDERS_ENABLED:
+        parts += [
+            "",
+            "⏰ Erinnerungen: \"erinnere mich morgen um 9 an den Zahnarzt\", "
+            "\"... montags, mittwochs und freitags an ...\" für mehrfach "
+            "wöchentlich, \"welche Erinnerungen hab ich?\", \"lösch "
+            "Erinnerung 3\"",
+            "📝 Notizen: \"notier dir: ...\", \"was hab ich notiert?\"",
+        ]
+    if gcal.CALENDAR_ENABLED:
+        parts += [
+            "",
+            "📅 Kalender: \"was steht diese Woche an?\", \"trag Zahnarzt "
+            "Montag 10 Uhr ein\", \"lösch den Termin am Freitag\"",
+        ]
+        if storage.REMINDERS_ENABLED:
+            parts.append(
+                "   Benachrichtigungen: \"gib mir morgens um 8 einen "
+                "Überblick\", \"sag mir 30 Minuten vor jedem Termin Bescheid\""
+            )
+    if recipes.RECIPES_ENABLED:
+        parts += [
+            "",
+            "🥗 Rezeptideen: \"erinnere mich 3x die Woche an ein gesundes "
+            "veganes Rezept\" — dann schlägt der Bot bei jeder Erinnerung "
+            "automatisch ein neues Rezept vor, ohne sich zu wiederholen.",
+        ]
+    if PROACTIVE_ENABLED:
+        parts += [
+            "",
+            f"👀 In Gruppen lese ich unauffällig mit und melde mich ab und "
+            f"zu von selbst, wenn mir was für {_proactive_targets_text()} "
+            "auffällt (z. B. 'brauchen wir noch Tomaten' → Vorschlag für "
+            "die Liste).",
+        ]
+    parts += [
+        "",
+        "Befehle:",
+        "/reset – Gesprächsverlauf löschen",
+        "/model – aktuelles Modell anzeigen",
+        "/help – diese Übersicht",
+    ]
+    return "\n".join(parts)
+
+
+HELP_TEXT = _build_help_text()
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -320,6 +532,10 @@ client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 # chat_id -> letzte Nachrichten
 history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
+
+# chat_id -> unadressierte Gruppennachrichten seit der letzten proaktiven
+# Prüfung (nur befüllt, wenn PROACTIVE_ENABLED).
+group_buffer: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
 
 
 def authorized(update: Update) -> bool:
@@ -335,12 +551,7 @@ def authorized(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    await update.message.reply_text(
-        "Hi! Schreib mir einfach etwas.\n\n"
-        "/reset – Gesprächsverlauf löschen\n"
-        "/model – aktuelles Modell anzeigen\n"
-        "/help – diese Hilfe"
-    )
+    await update.message.reply_text(HELP_TEXT)
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -397,11 +608,25 @@ async def call_reminder_tool(chat_id: int, name: str, arguments: dict) -> str:
     raise RuntimeError(f"Unbekanntes Reminder-Tool: {name}")
 
 
+async def call_calendar_tool(chat_id: int, name: str, arguments: dict) -> str:
+    if name == "list_calendar_events":
+        return await gcal.list_events_text(arguments.get("start"), arguments.get("end"))
+    if name == "create_calendar_event":
+        return await gcal.create_event(**arguments)
+    if name == "delete_calendar_event":
+        return await gcal.delete_event(arguments["event_id"])
+    if name == "set_calendar_notifications":
+        return await storage.set_calendar_notifications(chat_id, **arguments)
+    raise RuntimeError(f"Unbekanntes Kalender-Tool: {name}")
+
+
 async def call_tool(chat_id: int, name: str, arguments: dict) -> str:
     if name in BRING_TOOL_NAMES:
         return await call_bring_tool(name, arguments)
     if name in REMINDER_TOOL_NAMES:
         return await call_reminder_tool(chat_id, name, arguments)
+    if name in CALENDAR_TOOL_NAMES:
+        return await call_calendar_tool(chat_id, name, arguments)
     raise RuntimeError(f"Unbekanntes Tool: {name}")
 
 
@@ -509,6 +734,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     is_group = update.effective_chat.type in ("group", "supergroup")
     if is_group and not directly_addressed(update, context.bot.username):
+        if PROACTIVE_ENABLED and update.message.text:
+            sender = update.effective_user.first_name if update.effective_user else "?"
+            group_buffer[update.effective_chat.id].append(f"{sender}: {update.message.text}")
         return
 
     chat_id = update.effective_chat.id
@@ -638,6 +866,101 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         await storage.reschedule_or_delete(row["id"], row["due_at"], row["recurrence"])
 
 
+async def check_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Läuft periodisch (JobQueue): schickt den morgendlichen Tagesüberblick
+    und Vorab-Hinweise kurz vor anstehenden Terminen."""
+    now = datetime.now(gcal.TZ)
+    for sub in await storage.calendar_subs():
+        chat_id = sub["chat_id"]
+        try:
+            if sub["briefing_time"] and sub["last_briefing"] != now.date():
+                hour, _, minute = sub["briefing_time"].partition(":")
+                due = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+                if now >= due:
+                    events = await gcal.list_events(
+                        now.date().isoformat(), now.date().isoformat()
+                    )
+                    lines = [gcal.format_event(e) for e in events] or ["Nichts eingetragen. 🎉"]
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=("📅 Deine Termine heute:\n" + "\n".join(lines))[:4000],
+                    )
+                    await storage.mark_briefing_sent(chat_id, now.date())
+
+            if sub["lead_minutes"]:
+                horizon = now + timedelta(minutes=sub["lead_minutes"])
+                for event in await gcal.list_events(now.isoformat(), horizon.isoformat()):
+                    if gcal.is_all_day(event):
+                        continue  # ganztägige Termine haben keine sinnvolle Vorlaufzeit
+                    uid = f"{event['id']}:{gcal.event_start(event).isoformat()}"
+                    if await storage.mark_notified(chat_id, uid):
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🔔 Gleich: {gcal.format_event(event)}"[:4000],
+                        )
+        except Exception:
+            log.exception("Kalender-Benachrichtigung fehlgeschlagen (chat_id=%s)", chat_id)
+
+
+async def check_proactive_suggestions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Läuft periodisch (JobQueue): prüft gebündelt unadressierte Gruppen-
+    nachrichten der letzten Zeit und meldet sich nur, wenn wirklich etwas
+    für Einkaufsliste/Erinnerungen/Notizen sinnvoll erscheint."""
+    for chat_id, buf in list(group_buffer.items()):
+        if not buf:
+            continue
+        messages = list(buf)
+        buf.clear()  # als geprüft markieren, unabhängig vom Ergebnis
+
+        prompt = (
+            "Ausschnitt aus einem Gruppenchat, an den du nicht direkt "
+            "adressiert wurdest:\n\n" + "\n".join(messages) +
+            f"\n\nGibt es darin etwas, das sich für {_proactive_targets_text()} "
+            "eignet? Wenn ja: schlage GENAU EINE Sache kurz und konkret vor "
+            "und frag nach Bestätigung (z. B. 'Soll ich Tomaten auf die "
+            "Liste setzen?'). Wenn nichts eindeutig Sinnvolles dabei ist, "
+            "antworte NUR mit dem Wort NONE."
+        )
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Du bist ein aufmerksamer, aber zurückhaltender "
+                            "Assistent in einer Telegram-Gruppe. Du meldest "
+                            "dich nur, wenn wirklich etwas Konkretes und "
+                            "Nützliches vorzuschlagen ist, nie bei Kleinig- "
+                            "keiten oder Unklarem."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            suggestion = (response.choices[0].message.content or "").strip()
+        except Exception:
+            log.exception("Proaktive Prüfung fehlgeschlagen (chat_id=%s)", chat_id)
+            continue
+
+        if suggestion and suggestion.strip().upper() != "NONE":
+            suggestion = suggestion[:4000]
+            await context.bot.send_message(chat_id=chat_id, text=suggestion)
+            # Im Verlauf merken, damit eine Antwort wie "ja mach" später
+            # weiß, worauf sie sich bezieht.
+            history[chat_id].append({"role": "assistant", "content": suggestion})
+
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            continue  # der Bot wurde selbst hinzugefügt, keine Selbstbegrüßung
+        name = member.first_name or "zusammen"
+        await update.message.reply_text(f"Willkommen, {name}! 👋\n\n{HELP_TEXT}")
+
+
 async def _post_init(app: Application) -> None:
     await storage.init_db()
 
@@ -662,12 +985,20 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
 
     if storage.REMINDERS_ENABLED:
         # Prüft alle 60s auf fällige Erinnerungen. Render Free schläft nach
         # ~15 Min. Inaktivität ein -> für pünktliche Erinnerungen den Service
         # extern wachhalten (siehe README).
         app.job_queue.run_repeating(check_reminders, interval=60, first=10)
+
+    if gcal.CALENDAR_ENABLED and storage.REMINDERS_ENABLED:
+        app.job_queue.run_repeating(check_calendar, interval=60, first=20)
+
+    if PROACTIVE_ENABLED:
+        interval = PROACTIVE_INTERVAL_HOURS * 3600
+        app.job_queue.run_repeating(check_proactive_suggestions, interval=interval, first=interval)
 
     if WEBHOOK_URL:
         # Token im Pfad macht die URL selbst zum Geheimnis, damit niemand

@@ -5,7 +5,7 @@ genau wie die Bring-Anbindung ohne ihre Env-Vars.
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -57,6 +57,28 @@ async def init_db() -> None:
                 chat_id BIGINT NOT NULL,
                 text TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Wer will wie über Kalendertermine informiert werden?
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calendar_subs (
+                chat_id BIGINT PRIMARY KEY,
+                lead_minutes INT,
+                briefing_time TEXT,
+                last_briefing DATE
+            )
+            """
+        )
+        # Verhindert, dass derselbe Termin mehrfach angekündigt wird.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calendar_notified (
+                chat_id BIGINT NOT NULL,
+                event_uid TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (chat_id, event_uid)
             )
             """
         )
@@ -201,6 +223,73 @@ async def record_output(reminder_id: int, output_id: str, keep: int = 8) -> None
         updated = ((current or []) + [output_id])[-keep:]
         await conn.execute(
             "UPDATE reminders SET recent_outputs = $2 WHERE id = $1", reminder_id, updated
+        )
+
+
+async def set_calendar_notifications(
+    chat_id: int, briefing_time: str | None = None, lead_minutes: int | None = None
+) -> str:
+    """Legt fest, wie dieser Chat über Kalendertermine informiert wird.
+    Nicht übergebene Werte bleiben unverändert, 0/'off' schaltet einzeln ab."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO calendar_subs (chat_id) VALUES ($1) ON CONFLICT DO NOTHING", chat_id
+        )
+        if briefing_time is not None:
+            value = None if briefing_time.lower() in ("off", "aus", "") else briefing_time
+            await conn.execute(
+                "UPDATE calendar_subs SET briefing_time = $2, last_briefing = NULL WHERE chat_id = $1",
+                chat_id, value,
+            )
+        if lead_minutes is not None:
+            await conn.execute(
+                "UPDATE calendar_subs SET lead_minutes = $2 WHERE chat_id = $1",
+                chat_id, lead_minutes or None,
+            )
+        row = await conn.fetchrow(
+            "SELECT briefing_time, lead_minutes FROM calendar_subs WHERE chat_id = $1", chat_id
+        )
+
+    parts = []
+    parts.append(
+        f"Tagesüberblick um {row['briefing_time']} Uhr" if row["briefing_time"]
+        else "Tagesüberblick: aus"
+    )
+    parts.append(
+        f"Vorab-Hinweis {row['lead_minutes']} Min. vor Terminen" if row["lead_minutes"]
+        else "Vorab-Hinweis: aus"
+    )
+    return "Kalender-Benachrichtigungen: " + ", ".join(parts) + "."
+
+
+async def calendar_subs() -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT chat_id, lead_minutes, briefing_time, last_briefing FROM calendar_subs "
+            "WHERE briefing_time IS NOT NULL OR lead_minutes IS NOT NULL"
+        )
+    return [dict(row) for row in rows]
+
+
+async def mark_notified(chat_id: int, event_uid: str) -> bool:
+    """True, wenn dieser Termin für diesen Chat noch nicht angekündigt war."""
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO calendar_notified (chat_id, event_uid) VALUES ($1, $2) "
+            "ON CONFLICT DO NOTHING RETURNING chat_id",
+            chat_id, event_uid,
+        )
+    return row is not None
+
+
+async def mark_briefing_sent(chat_id: int, day: date) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE calendar_subs SET last_briefing = $2 WHERE chat_id = $1", chat_id, day
+        )
+        # Alte Dedupe-Einträge aufräumen, damit die Tabelle nicht unbegrenzt wächst.
+        await conn.execute(
+            "DELETE FROM calendar_notified WHERE created_at < now() - INTERVAL '7 days'"
         )
 
 

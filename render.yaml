@@ -38,3 +38,9 @@ services:
         value: Europe/Berlin
       - key: RECIPE_API_KEY
         sync: false
+      - key: PROACTIVE_INTERVAL_HOURS
+        value: "0"
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_CALENDAR_ID
+        sync: false
