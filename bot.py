@@ -56,6 +56,15 @@ PDF_MAX_CHARS = int(os.getenv("PDF_MAX_CHARS", "15000"))
 # Obergrenze fürs Herunterladen/Parsen: pypdf kann bei präparierten Dateien viel
 # Speicher ziehen, die Render-Free-Instanz hat nur 512 MB.
 PDF_MAX_BYTES = int(os.getenv("PDF_MAX_MB", "10")) * 1024 * 1024
+# Sprachnachrichten: Transkription läuft über denselben Endpoint/Key wie MODEL.
+# Leer = Feature aus (z. B. wenn der Provider keine Transkription anbietet —
+# Groq und OpenAI können es, Geminis OpenAI-Endpoint nicht).
+VOICE_MODEL = os.getenv("VOICE_MODEL", "whisper-large-v3-turbo")
+VOICE_ENABLED = bool(VOICE_MODEL)
+# Feste Sprache verbessert die Erkennung merklich; leer = automatisch erkennen.
+VOICE_LANGUAGE = os.getenv("VOICE_LANGUAGE", "de")
+# Groq nimmt max. 25 MB; Telegram-Sprachnachrichten liegen weit darunter.
+VOICE_MAX_BYTES = int(os.getenv("VOICE_MAX_MB", "20")) * 1024 * 1024
 # Marker, die Fremdinhalte (PDF-Text) klar als Daten statt Anweisung abgrenzen.
 _UNTRUSTED_START = "<<<DOKUMENT_ANFANG>>>"
 _UNTRUSTED_END = "<<<DOKUMENT_ENDE>>>"
@@ -489,6 +498,13 @@ def _build_help_text() -> str:
         "🖼 Bilder & 📄 PDFs: einfach als Foto oder Dokument schicken, ich "
         "lese bzw. beschreibe den Inhalt.",
     ]
+    if VOICE_ENABLED:
+        parts += [
+            "",
+            "🎤 Sprachnachrichten gehen auch — ich schreibe dir kurz mit, was "
+            "ich verstanden habe, und mache dann dasselbe wie bei getipptem "
+            "Text (Liste, Termine, Erinnerungen).",
+        ]
     if BRING_ENABLED:
         parts += [
             "",
@@ -683,11 +699,19 @@ def _trigger_source(message) -> tuple[str, list]:
     return message.caption or "", message.caption_entities or []
 
 
+def _is_reply_to_bot(message, bot_username: str) -> bool:
+    reply_to = message.reply_to_message
+    return (
+        reply_to is not None
+        and reply_to.from_user is not None
+        and reply_to.from_user.username == bot_username
+    )
+
+
 def directly_addressed(update: Update, bot_username: str) -> bool:
     """In Gruppen: nur bei @mention, Reply auf eine Bot-Nachricht oder Namensnennung reagieren."""
     message = update.message
-    reply_to = message.reply_to_message
-    if reply_to is not None and reply_to.from_user is not None and reply_to.from_user.username == bot_username:
+    if _is_reply_to_bot(message, bot_username):
         return True
     text, entities = _trigger_source(message)
     for entity in entities:
@@ -774,6 +798,69 @@ async def reply_with_llm(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     # Telegram-Limit: 4096 Zeichen pro Nachricht
     for i in range(0, len(answer), 4000):
         await update.message.reply_text(answer[i : i + 4000])
+
+
+async def transcribe(audio: bytes, filename: str) -> str:
+    """Sprachnachricht -> Text, über denselben Endpoint/Key wie das Textmodell."""
+    kwargs = {"language": VOICE_LANGUAGE} if VOICE_LANGUAGE else {}
+    response = await client.audio.transcriptions.create(
+        model=VOICE_MODEL, file=(filename, audio), **kwargs
+    )
+    return (response.text or "").strip()
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        await deny(update)
+        return
+
+    is_group = update.effective_chat.type in ("group", "supergroup")
+    chat_id = update.effective_chat.id
+    voice = update.message.voice
+
+    if voice.file_size and voice.file_size > VOICE_MAX_BYTES:
+        await update.message.reply_text(
+            f"Die Sprachnachricht ist zu groß (>{VOICE_MAX_BYTES // (1024 * 1024)} MB)."
+        )
+        return
+
+    file = await context.bot.get_file(voice.file_id)
+    raw = await file.download_as_bytearray()
+
+    typing = asyncio.create_task(keep_typing(context, chat_id))
+    try:
+        # Telegram liefert Opus in einem Ogg-Container; das nimmt Whisper direkt,
+        # eine Umwandlung (ffmpeg) ist nicht nötig.
+        transcript = await transcribe(bytes(raw), "sprachnachricht.ogg")
+    except Exception:
+        log.exception("Transkription fehlgeschlagen")
+        await update.message.reply_text(
+            "Die Sprachnachricht konnte ich nicht verarbeiten. Nochmal versuchen?"
+        )
+        return
+    finally:
+        typing.cancel()
+
+    if not transcript:
+        await update.message.reply_text("Da war nichts Verständliches drin.")
+        return
+
+    # In Gruppen erst jetzt entscheiden, ob der Bot gemeint war: der Trigger
+    # steckt im gesprochenen Wort, vor der Transkription kennen wir ihn nicht.
+    if is_group and not (
+        _is_reply_to_bot(update.message, context.bot.username)
+        or NAME_TRIGGER_RE.search(transcript)
+    ):
+        return
+
+    # Transkript zeigen, damit bei Erkennungsfehlern sichtbar ist, worauf der
+    # Bot gleich reagiert.
+    await update.message.reply_text(f"🎤 {transcript}"[:4000])
+
+    sender = update.effective_user.first_name if update.effective_user else "User"
+    prompt_text = f"{sender}: {transcript}" if is_group else transcript
+
+    await reply_with_llm(update, context, chat_id, prompt_text, prompt_text)
 
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1052,6 +1139,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+    if VOICE_ENABLED:
+        app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members))
 
     if not ALLOWED_USERS and not ALLOWED_CHATS:

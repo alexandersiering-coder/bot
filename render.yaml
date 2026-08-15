@@ -34,6 +34,10 @@ services:
         sync: false
       - key: VISION_MODEL
         value: qwen/qwen3.6-27b
+      - key: VOICE_MODEL
+        value: whisper-large-v3-turbo
+      - key: VOICE_LANGUAGE
+        value: de
       - key: DATABASE_URL
         sync: false
       - key: TIMEZONE

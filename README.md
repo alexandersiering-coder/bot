@@ -47,6 +47,8 @@ Alles andere (normaler Text) geht ans Modell.
 | `BRING_MCP_TOKEN`  | Optional, s. u. „Bring!-Einkaufsliste"                            |
 | `VISION_MODEL`     | Modell für Bilder (Default `qwen/qwen3.6-27b`, Groq)               |
 | `PDF_MAX_CHARS`    | Max. Zeichen aus einer PDF ans Modell (Default 15000)              |
+| `VOICE_MODEL`      | Modell für Sprachnachrichten (Default `whisper-large-v3-turbo`). Leer = aus |
+| `VOICE_LANGUAGE`   | Sprache der Sprachnachrichten (Default `de`). Leer = automatisch erkennen |
 | `DATABASE_URL`     | Optional, s. u. „Erinnerungen & Notizen"                          |
 | `TIMEZONE`         | Zeitzone für Erinnerungen (Default `Europe/Berlin`)                |
 | `RECIPE_API_KEY`   | Optional, s. u. „Vegane Rezeptvorschläge"                          |
@@ -209,6 +211,33 @@ inaktiv. Default `0` = aus.
 **Begrüßung neuer Mitglieder** läuft unabhängig davon immer: Tritt jemand der
 Gruppe bei, schickt der Bot automatisch die Kurzanleitung (`/help`-Text) als
 Willkommensnachricht.
+
+## Sprachnachrichten
+
+Einfach reinsprechen — der Bot transkribiert und behandelt das Ergebnis wie
+getippten Text. „Kollege, trag Milch auf die Liste" oder „erinnere mich morgen
+um 9 an den Zahnarzt" funktionieren also auch gesprochen, inklusive Kalender,
+Einkaufsliste und Erinnerungen.
+
+Die Transkription läuft über **denselben Key und Endpoint wie das Textmodell**
+(`LLM_API_KEY` / `LLM_BASE_URL`) — bei Groq und OpenAI ohne weiteres Setup.
+Telegram schickt Opus im Ogg-Container, das nimmt Whisper direkt entgegen; eine
+Umwandlung mit ffmpeg ist nicht nötig (auf Render gibt es das auch gar nicht).
+
+Der Bot schickt zuerst das erkannte Transkript (`🎤 …`) und antwortet dann —
+so ist bei Erkennungsfehlern sichtbar, worauf er reagiert, bevor er handelt.
+
+**In Gruppen** wird erst *nach* der Transkription entschieden, ob der Bot
+gemeint war: das Triggerwort steckt ja im gesprochenen Text. Ohne `Kollege`
+(oder Reply auf den Bot) bleibt er still.
+
+Anders als bei PDFs bleiben Tools hier **aktiv** — eine Sprachnachricht kommt
+von einer freigeschalteten Person, die bewusst spricht, nicht aus einem
+fremden Dokument. Das Prompt-Injection-Risiko von PDFs besteht hier nicht.
+
+Falls dein Provider keine Transkription anbietet (z. B. Geminis
+OpenAI-Endpoint), `VOICE_MODEL` leer lassen — dann ignoriert der Bot
+Sprachnachrichten.
 
 ## Bilder und PDFs
 
