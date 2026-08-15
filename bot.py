@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 from pypdf import PdfReader
 from telegram import Update
 from telegram.constants import ChatAction
@@ -646,6 +646,22 @@ def _format_error(err: BaseException) -> str:
     return " | caused by | ".join(parts)
 
 
+def _rate_limit_message(err: RateLimitError) -> str:
+    """Nutzerfreundliche Meldung mit Wartezeit aus dem 'retry-after'-Header.
+
+    Der Header ist zuverlässiger als der Freitext in der Fehlermeldung, den
+    der Anbieter jederzeit ändern könnte.
+    """
+    retry_after = err.response.headers.get("retry-after")
+    if retry_after is not None:
+        try:
+            minutes = max(1, round(float(retry_after) / 60))
+            return f"Tageslimit beim Sprachmodell erschöpft. In ca. {minutes} Minuten geht's von selbst wieder."
+        except ValueError:
+            pass
+    return "Tageslimit beim Sprachmodell erschöpft. Versuch's in ein paar Minuten nochmal."
+
+
 async def call_bring_tool(name: str, arguments: dict) -> str:
     """Ruft ein Tool auf dem Bring-MCP-Server auf und gibt das Ergebnis als Text zurück."""
     async with streamablehttp_client(
@@ -812,6 +828,10 @@ async def reply_with_llm(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     try:
         answer = await ask_llm(chat_id, content, thread_id=thread_id, model=model,
                                use_tools=use_tools, extra_body=extra_body)
+    except RateLimitError as err:
+        log.warning("Rate-Limit beim Modell: %s", _format_error(err))
+        await update.message.reply_text(_rate_limit_message(err))
+        return
     except Exception:
         log.exception("LLM-Aufruf fehlgeschlagen")
         await update.message.reply_text("Da ist beim Modell etwas schiefgelaufen. Nochmal versuchen?")
