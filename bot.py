@@ -229,6 +229,14 @@ async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"Modell: {MODEL}\nEndpoint: {BASE_URL}")
 
 
+def _format_error(err: BaseException) -> str:
+    """Klartext auch für ExceptionGroups (z. B. 'unhandled errors in a TaskGroup')."""
+    parts = [f"{type(err).__name__}: {err}"]
+    for sub in getattr(err, "exceptions", []):
+        parts.append(_format_error(sub))
+    return " | caused by | ".join(parts)
+
+
 async def call_bring_tool(name: str, arguments: dict) -> str:
     """Ruft ein Tool auf dem Bring-MCP-Server auf und gibt das Ergebnis als Text zurück."""
     async with streamablehttp_client(
@@ -299,7 +307,7 @@ async def ask_llm(chat_id: int, content, *, model: str = MODEL, use_tools: bool 
             try:
                 result = await call_bring_tool(tool_call.function.name, args)
             except Exception as err:
-                log.warning("Bring-Tool-Call fehlgeschlagen: %s", err)
+                log.warning("Bring-Tool-Call fehlgeschlagen: %s", _format_error(err))
                 result = f"Fehler: {err}"
             messages.append({
                 "role": "tool",
