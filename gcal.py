@@ -22,7 +22,9 @@ CALENDAR_ENABLED = bool(_RAW_CREDENTIALS and CALENDAR_ID)
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Berlin")
 TZ = ZoneInfo(TIMEZONE)
 
-_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+# Nur Termine, nicht die Kalenderverwaltung selbst (Freigaben, Kalender
+# anlegen/löschen) — der Bot braucht nicht mehr als das.
+_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 _WEEKDAYS_SHORT = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 
 _service = None

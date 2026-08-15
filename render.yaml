@@ -22,6 +22,8 @@ services:
         value: "10"
       - key: ALLOWED_USER_IDS
         sync: false
+      - key: ALLOWED_CHAT_IDS
+        sync: false
       - key: BOT_NAME_TRIGGER
         value: Kollege
       - key: WEBHOOK_SECRET
