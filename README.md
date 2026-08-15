@@ -46,6 +46,8 @@ Alles andere (normaler Text) geht ans Modell.
 | `BRING_MCP_TOKEN`  | Optional, s. u. „Bring!-Einkaufsliste"                            |
 | `VISION_MODEL`     | Modell für Bilder (Default `qwen/qwen3.6-27b`, Groq)               |
 | `PDF_MAX_CHARS`    | Max. Zeichen aus einer PDF ans Modell (Default 15000)              |
+| `DATABASE_URL`     | Optional, s. u. „Erinnerungen & Notizen"                          |
+| `TIMEZONE`         | Zeitzone für Erinnerungen (Default `Europe/Berlin`)                |
 
 In Gruppen antwortet der Bot nur, wenn er per `@alesie_bot` erwähnt wird, auf
 seine eigene Nachricht geantwortet wird, oder `BOT_NAME_TRIGGER` im Text
@@ -71,6 +73,39 @@ BRING_MCP_TOKEN=<dasselbe Token wie im Bring-MCP-Server>
 ```
 
 Ohne beide Variablen bleibt das Feature einfach aus, der Bot verhält sich wie
+zuvor.
+
+## Erinnerungen & Notizen
+
+Wenn `DATABASE_URL` gesetzt ist, kann der Bot per natürlicher Sprache
+Erinnerungen setzen und Notizen speichern ("Kollege, erinnere mich morgen um
+9 an den Zahnarzt", "erinnere mich jeden Montag ans Müll rausbringen", "notier
+dir: WLAN-Passwort ist ..."). Das Modell entscheidet per Function Calling
+selbst, wann es `create_reminder`, `list_reminders`, `delete_reminder`,
+`create_note`, `list_notes` oder `delete_note` aufruft — dieselbe Technik wie
+bei der Bring!-Anbindung.
+
+Erinnerungen liegen in Postgres (persistiert über Deploys hinweg, anders als
+der In-Memory-Verlauf). Kostenlos ohne Kreditkarte z. B. bei
+[neon.tech](https://neon.tech): Projekt anlegen, die Connection-String-URL
+(„Connection string", Format `postgresql://user:pass@host/db?sslmode=require`)
+kopieren und als `DATABASE_URL` eintragen. Tabellen legt der Bot beim Start
+selbst an.
+
+Ein Hintergrund-Job im Bot prüft alle 60 Sekunden auf fällige Erinnerungen und
+verschickt sie automatisch. `recurrence` steuert Wiederholung: `once`
+(Standard), `daily`, `weekly`.
+
+**Wichtig auf Render Free:** Der Service schläft nach ~15 Min. Inaktivität
+ein (s. u.) — dann pausiert auch der Erinnerungs-Check, bis die nächste
+Nachricht ihn aufweckt (verpasste Erinnerungen kommen dann leicht verspätet
+nach, gehen aber nicht verloren). Für pünktliche Erinnerungen den Service
+extern wachhalten, z. B. mit einem kostenlosen Cron-Ping auf die Render-URL
+alle 5–10 Min. über [cron-job.org](https://cron-job.org) oder
+[UptimeRobot](https://uptimerobot.com) — der Pfad ist egal, ein einfacher
+GET auf die Basis-URL reicht (auch ein 404 zählt als „aufgeweckt").
+
+Ohne `DATABASE_URL` bleibt das Feature einfach aus, der Bot verhält sich wie
 zuvor.
 
 ## Bilder und PDFs

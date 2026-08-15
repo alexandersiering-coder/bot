@@ -25,6 +25,8 @@ from telegram.ext import (
     filters,
 )
 
+import storage
+
 load_dotenv()
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -80,6 +82,18 @@ if BRING_ENABLED:
         "remove_items). Nutze sie, wenn im Chat nach der Einkaufsliste "
         "gefragt wird oder etwas hinzugefügt, abgehakt oder entfernt "
         "werden soll. Frag nicht extra nach, ruf die Funktion direkt auf."
+    )
+
+if storage.REMINDERS_ENABLED:
+    SYSTEM_PROMPT += (
+        "\n\nDu hast über Functions Zugriff auf Erinnerungen und Notizen "
+        "(create_reminder, list_reminders, delete_reminder, create_note, "
+        "list_notes, delete_note). Erinnerungen werden dem Nutzer automatisch "
+        "als Telegram-Nachricht zum angegebenen Zeitpunkt geschickt. Rechne "
+        "relative Zeitangaben ('morgen', 'in 2 Stunden', 'nächsten Montag') "
+        "anhand des unten angegebenen aktuellen Datums in ein konkretes "
+        "ISO-Datetime um. Nutze die Functions direkt, wenn danach gefragt "
+        "wird, ohne extra nachzufragen."
     )
 
 BRING_TOOLS = [
@@ -183,6 +197,91 @@ BRING_TOOLS = [
     },
 ]
 
+REMINDER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_reminder",
+            "description": (
+                "Legt eine Erinnerung an, die dem Nutzer zum angegebenen "
+                "Zeitpunkt automatisch per Telegram-Nachricht geschickt wird."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Woran erinnert werden soll."},
+                    "due_at": {
+                        "type": "string",
+                        "description": "Zeitpunkt als ISO-8601 ohne Zeitzone, z. B. '2026-08-16T09:00'.",
+                    },
+                    "recurrence": {
+                        "type": "string",
+                        "enum": ["once", "daily", "weekly"],
+                        "description": "Wiederholung der Erinnerung. Standard: once (einmalig).",
+                    },
+                },
+                "required": ["text", "due_at"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": "Zeigt alle anstehenden Erinnerungen dieses Chats mit ID an.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_reminder",
+            "description": "Löscht eine Erinnerung anhand ihrer ID (siehe list_reminders).",
+            "parameters": {
+                "type": "object",
+                "properties": {"reminder_id": {"type": "integer"}},
+                "required": ["reminder_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_note",
+            "description": "Speichert eine Notiz für diesen Chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_notes",
+            "description": "Zeigt alle gespeicherten Notizen dieses Chats mit ID an.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_note",
+            "description": "Löscht eine Notiz anhand ihrer ID (siehe list_notes).",
+            "parameters": {
+                "type": "object",
+                "properties": {"note_id": {"type": "integer"}},
+                "required": ["note_id"],
+            },
+        },
+    },
+]
+
+ALL_TOOLS = (BRING_TOOLS if BRING_ENABLED else []) + (REMINDER_TOOLS if storage.REMINDERS_ENABLED else [])
+BRING_TOOL_NAMES = {t["function"]["name"] for t in BRING_TOOLS}
+REMINDER_TOOL_NAMES = {t["function"]["name"] for t in REMINDER_TOOLS}
+
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
@@ -252,6 +351,30 @@ async def call_bring_tool(name: str, arguments: dict) -> str:
             return text
 
 
+async def call_reminder_tool(chat_id: int, name: str, arguments: dict) -> str:
+    if name == "create_reminder":
+        return await storage.create_reminder(chat_id, **arguments)
+    if name == "list_reminders":
+        return await storage.list_reminders(chat_id)
+    if name == "delete_reminder":
+        return await storage.delete_reminder(chat_id, arguments["reminder_id"])
+    if name == "create_note":
+        return await storage.create_note(chat_id, arguments["text"])
+    if name == "list_notes":
+        return await storage.list_notes(chat_id)
+    if name == "delete_note":
+        return await storage.delete_note(chat_id, arguments["note_id"])
+    raise RuntimeError(f"Unbekanntes Reminder-Tool: {name}")
+
+
+async def call_tool(chat_id: int, name: str, arguments: dict) -> str:
+    if name in BRING_TOOL_NAMES:
+        return await call_bring_tool(name, arguments)
+    if name in REMINDER_TOOL_NAMES:
+        return await call_reminder_tool(chat_id, name, arguments)
+    raise RuntimeError(f"Unbekanntes Tool: {name}")
+
+
 def _trigger_source(message) -> tuple[str, list]:
     """Text+Entities einer Nachricht, egal ob normaler Text oder Bild-/PDF-Caption."""
     if message.text is not None:
@@ -283,10 +406,14 @@ async def ask_llm(chat_id: int, content, *, model: str = MODEL, use_tools: bool 
     macht der Aufrufer, weil er entscheidet, was davon als Kontext für
     künftige Turns gespeichert werden soll (z. B. keine rohen Bild-Bytes).
     """
+    system_content = SYSTEM_PROMPT
+    if storage.REMINDERS_ENABLED:
+        system_content += f"\n\nAktuelles Datum/Uhrzeit: {storage.now_local_label()}."
+
     convo = history[chat_id]
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *convo,
+    messages = [{"role": "system", "content": system_content}, *convo,
                 {"role": "user", "content": content}]
-    llm_kwargs = {"tools": BRING_TOOLS, "tool_choice": "auto"} if (use_tools and BRING_ENABLED) else {}
+    llm_kwargs = {"tools": ALL_TOOLS, "tool_choice": "auto"} if (use_tools and ALL_TOOLS) else {}
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
@@ -305,9 +432,9 @@ async def ask_llm(chat_id: int, content, *, model: str = MODEL, use_tools: bool 
         for tool_call in msg.tool_calls:
             args = json.loads(tool_call.function.arguments or "{}")
             try:
-                result = await call_bring_tool(tool_call.function.name, args)
+                result = await call_tool(chat_id, tool_call.function.name, args)
             except Exception as err:
-                log.warning("Bring-Tool-Call fehlgeschlagen: %s", _format_error(err))
+                log.warning("Tool-Call fehlgeschlagen: %s", _format_error(err))
                 result = f"Fehler: {err}"
             messages.append({
                 "role": "tool",
@@ -461,11 +588,31 @@ async def keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
         pass
 
 
+async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Läuft periodisch (JobQueue) und verschickt fällige Erinnerungen."""
+    for row in await storage.due_reminders():
+        try:
+            await context.bot.send_message(chat_id=row["chat_id"], text=f"⏰ {row['text']}")
+        except Exception:
+            log.exception("Erinnerung konnte nicht gesendet werden (chat_id=%s)", row["chat_id"])
+        await storage.reschedule_or_delete(row["id"], row["recurrence"])
+
+
+async def _post_init(app: Application) -> None:
+    await storage.init_db()
+
+
+async def _post_shutdown(app: Application) -> None:
+    await storage.close_db()
+
+
 def main() -> None:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .rate_limiter(AIORateLimiter())
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
@@ -475,6 +622,12 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
+
+    if storage.REMINDERS_ENABLED:
+        # Prüft alle 60s auf fällige Erinnerungen. Render Free schläft nach
+        # ~15 Min. Inaktivität ein -> für pünktliche Erinnerungen den Service
+        # extern wachhalten (siehe README).
+        app.job_queue.run_repeating(check_reminders, interval=60, first=10)
 
     if WEBHOOK_URL:
         # Token im Pfad macht die URL selbst zum Geheimnis, damit niemand

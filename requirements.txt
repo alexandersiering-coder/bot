@@ -1,5 +1,6 @@
-python-telegram-bot[rate-limiter,webhooks]>=21.9
+python-telegram-bot[rate-limiter,webhooks,job-queue]>=21.9
 openai>=1.60
 python-dotenv>=1.0
 mcp>=1.9.0,<2.0.0
 pypdf>=5.0
+asyncpg>=0.29
