@@ -28,3 +28,5 @@ services:
         sync: false
       - key: BRING_MCP_TOKEN
         sync: false
+      - key: VISION_MODEL
+        value: qwen/qwen3.6-27b

@@ -44,6 +44,8 @@ Alles andere (normaler Text) geht ans Modell.
 | `WEBHOOK_SECRET`   | Optional, zusätzliche Absicherung des Webhooks (s.u.)             |
 | `BRING_MCP_URL`    | Optional, s. u. „Bring!-Einkaufsliste"                            |
 | `BRING_MCP_TOKEN`  | Optional, s. u. „Bring!-Einkaufsliste"                            |
+| `VISION_MODEL`     | Modell für Bilder (Default `qwen/qwen3.6-27b`, Groq)               |
+| `PDF_MAX_CHARS`    | Max. Zeichen aus einer PDF ans Modell (Default 15000)              |
 
 In Gruppen antwortet der Bot nur, wenn er per `@alesie_bot` erwähnt wird, auf
 seine eigene Nachricht geantwortet wird, oder `BOT_NAME_TRIGGER` im Text
@@ -70,6 +72,20 @@ BRING_MCP_TOKEN=<dasselbe Token wie im Bring-MCP-Server>
 
 Ohne beide Variablen bleibt das Feature einfach aus, der Bot verhält sich wie
 zuvor.
+
+## Bilder und PDFs
+
+- **Bilder**: einfach als Foto schicken (in Gruppen mit `Kollege` in der
+  Bildunterschrift oder als Reply). Läuft über ein eigenes Vision-Modell
+  (`VISION_MODEL`), unabhängig vom Text-Modell — der Groq-Default
+  `llama-3.3-70b-versatile` kann selbst keine Bilder lesen. Max. 4 MB.
+- **PDFs**: als Dokument schicken. Text wird lokal mit `pypdf` extrahiert und
+  ganz normal ans Text-Modell gegeben (funktioniert also mit jedem Modell,
+  auch ohne Vision-Support). Nur für PDFs mit echter Textebene — gescannte
+  PDFs ohne Text meldet der Bot als nicht lesbar.
+- Weder Bild noch PDF-Volltext landen im Gesprächsverlauf (nur eine kurze
+  Notiz wie „[Bild gesendet] ..."), damit spätere Nachrichten nicht ständig
+  die alten Datenmengen mitschleppen.
 
 ## Hinweise
 
