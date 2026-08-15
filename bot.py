@@ -18,6 +18,7 @@ from openai import AsyncOpenAI
 from pypdf import PdfReader
 from telegram import Update
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -571,7 +572,9 @@ history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
 
 # chat_id -> unadressierte Gruppennachrichten seit der letzten proaktiven
 # Prüfung (nur befüllt, wenn PROACTIVE_ENABLED).
-group_buffer: dict[int, deque] = defaultdict(lambda: deque(maxlen=200))
+# Schlüssel: (chat_id, thread_id) — in Forum-Gruppen ist jedes Thema ein
+# eigenes Gespräch, der Vorschlag soll dort landen, wo er entstanden ist.
+group_buffer: dict[tuple[int, int | None], deque] = defaultdict(lambda: deque(maxlen=200))
 
 
 def authorized(update: Update) -> bool:
@@ -652,11 +655,14 @@ async def call_bring_tool(name: str, arguments: dict) -> str:
             return text
 
 
-async def call_reminder_tool(chat_id: int, name: str, arguments: dict) -> str:
+async def call_reminder_tool(chat_id: int, thread_id: int | None, name: str, arguments: dict) -> str:
+    # thread_id kommt aus der Nachricht, nie vom Modell — ein halluziniertes
+    # Argument dieses Namens würde sonst mit dem echten kollidieren.
+    arguments.pop("thread_id", None)
     if name == "create_reminder":
         if arguments.get("kind") == "vegan_recipe" and not recipes.RECIPES_ENABLED:
             return "Fehler: Die Rezept-API ist nicht konfiguriert (RECIPE_API_KEY fehlt)."
-        return await storage.create_reminder(chat_id, **arguments)
+        return await storage.create_reminder(chat_id, thread_id=thread_id, **arguments)
     if name == "list_reminders":
         return await storage.list_reminders(chat_id)
     if name == "delete_reminder":
@@ -670,7 +676,8 @@ async def call_reminder_tool(chat_id: int, name: str, arguments: dict) -> str:
     raise RuntimeError(f"Unbekanntes Reminder-Tool: {name}")
 
 
-async def call_calendar_tool(chat_id: int, name: str, arguments: dict) -> str:
+async def call_calendar_tool(chat_id: int, thread_id: int | None, name: str, arguments: dict) -> str:
+    arguments.pop("thread_id", None)
     if name == "list_calendar_events":
         return await gcal.list_events_text(arguments.get("start"), arguments.get("end"))
     if name == "create_calendar_event":
@@ -678,18 +685,30 @@ async def call_calendar_tool(chat_id: int, name: str, arguments: dict) -> str:
     if name == "delete_calendar_event":
         return await gcal.delete_event(arguments["event_id"])
     if name == "set_calendar_notifications":
-        return await storage.set_calendar_notifications(chat_id, **arguments)
+        return await storage.set_calendar_notifications(chat_id, thread_id=thread_id, **arguments)
     raise RuntimeError(f"Unbekanntes Kalender-Tool: {name}")
 
 
-async def call_tool(chat_id: int, name: str, arguments: dict) -> str:
+async def call_tool(chat_id: int, thread_id: int | None, name: str, arguments: dict) -> str:
     if name in BRING_TOOL_NAMES:
         return await call_bring_tool(name, arguments)
     if name in REMINDER_TOOL_NAMES:
-        return await call_reminder_tool(chat_id, name, arguments)
+        return await call_reminder_tool(chat_id, thread_id, name, arguments)
     if name in CALENDAR_TOOL_NAMES:
-        return await call_calendar_tool(chat_id, name, arguments)
+        return await call_calendar_tool(chat_id, thread_id, name, arguments)
     raise RuntimeError(f"Unbekanntes Tool: {name}")
+
+
+def thread_id_of(message) -> int | None:
+    """Thema einer Forum-Gruppe, in dem die Nachricht steht (sonst None).
+
+    Der Check auf `is_topic_message` ist wichtig: in normalen Gruppen ist
+    `message_thread_id` nur die ID der ersten Nachricht einer Antwortkette
+    und als Sendeziel ungültig.
+    """
+    if message is None or not message.is_topic_message:
+        return None
+    return message.message_thread_id
 
 
 def _trigger_source(message) -> tuple[str, list]:
@@ -722,7 +741,8 @@ def directly_addressed(update: Update, bot_username: str) -> bool:
     return False
 
 
-async def ask_llm(chat_id: int, content, *, model: str = MODEL, use_tools: bool = True,
+async def ask_llm(chat_id: int, content, *, thread_id: int | None = None,
+                   model: str = MODEL, use_tools: bool = True,
                    extra_body: dict | None = None) -> str:
     """Schickt `content` (String oder Multimodal-Content-Liste) ans Modell.
 
@@ -757,7 +777,7 @@ async def ask_llm(chat_id: int, content, *, model: str = MODEL, use_tools: bool 
         for tool_call in msg.tool_calls:
             args = json.loads(tool_call.function.arguments or "{}")
             try:
-                result = await call_tool(chat_id, tool_call.function.name, args)
+                result = await call_tool(chat_id, thread_id, tool_call.function.name, args)
             except Exception as err:
                 # Details nur ins Log: Exceptions von asyncpg/httpx enthalten
                 # teils Hostnamen und Verbindungsdaten, die weder ins Modell
@@ -781,9 +801,11 @@ async def reply_with_llm(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     `history_text` ist die kompakte Text-Repräsentation, die im Verlauf
     landet (statt z. B. roher Bild-Daten).
     """
-    typing = asyncio.create_task(keep_typing(context, chat_id))
+    thread_id = thread_id_of(update.message)
+    typing = asyncio.create_task(keep_typing(context, chat_id, thread_id))
     try:
-        answer = await ask_llm(chat_id, content, model=model, use_tools=use_tools, extra_body=extra_body)
+        answer = await ask_llm(chat_id, content, thread_id=thread_id, model=model,
+                               use_tools=use_tools, extra_body=extra_body)
     except Exception:
         log.exception("LLM-Aufruf fehlgeschlagen")
         await update.message.reply_text("Da ist beim Modell etwas schiefgelaufen. Nochmal versuchen?")
@@ -827,7 +849,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(voice.file_id)
     raw = await file.download_as_bytearray()
 
-    typing = asyncio.create_task(keep_typing(context, chat_id))
+    typing = asyncio.create_task(keep_typing(context, chat_id, thread_id_of(update.message)))
     try:
         # Telegram liefert Opus in einem Ogg-Container; das nimmt Whisper direkt,
         # eine Umwandlung (ffmpeg) ist nicht nötig.
@@ -872,7 +894,8 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_group and not directly_addressed(update, context.bot.username):
         if PROACTIVE_ENABLED and update.message.text:
             sender = update.effective_user.first_name if update.effective_user else "?"
-            group_buffer[update.effective_chat.id].append(f"{sender}: {update.message.text}")
+            key = (update.effective_chat.id, thread_id_of(update.message))
+            group_buffer[key].append(f"{sender}: {update.message.text}")
         return
 
     chat_id = update.effective_chat.id
@@ -988,14 +1011,36 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await reply_with_llm(update, context, chat_id, prompt_text, history_text, use_tools=False)
 
 
-async def keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+async def keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                      thread_id: int | None = None) -> None:
     """Zeigt 'schreibt...' an, solange das Modell arbeitet."""
     try:
         while True:
-            await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await context.bot.send_chat_action(
+                chat_id, ChatAction.TYPING, message_thread_id=thread_id
+            )
             await asyncio.sleep(4)
     except asyncio.CancelledError:
         pass
+
+
+async def send_to(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                  thread_id: int | None, text: str) -> None:
+    """Sendet in ein Forum-Thema, mit Rückfall auf den Hauptchat.
+
+    Gelöschte oder archivierte Themen quittiert Telegram mit BadRequest —
+    dann soll die Erinnerung trotzdem ankommen statt verloren zu gehen.
+    """
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id, text=text, message_thread_id=thread_id
+        )
+    except BadRequest:
+        if thread_id is None:
+            raise
+        log.info("Thema %s in Chat %s nicht erreichbar, sende in den Hauptchat.",
+                 thread_id, chat_id)
+        await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1012,7 +1057,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
                 else:
                     text = f"{row['text']} (gerade kein Rezept gefunden, nächstes Mal wieder)"
             # Telegram-Limit: 4096 Zeichen pro Nachricht
-            await context.bot.send_message(chat_id=row["chat_id"], text=f"⏰ {text}"[:4000])
+            await send_to(context, row["chat_id"], row["thread_id"], f"⏰ {text}"[:4000])
         except Exception:
             log.exception("Erinnerung konnte nicht gesendet werden (chat_id=%s)", row["chat_id"])
         await storage.reschedule_or_delete(row["id"], row["due_at"], row["recurrence"])
@@ -1024,6 +1069,7 @@ async def check_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(gcal.TZ)
     for sub in await storage.calendar_subs():
         chat_id = sub["chat_id"]
+        thread_id = sub["thread_id"]
         try:
             if sub["briefing_time"] and sub["last_briefing"] != now.date():
                 hour, _, minute = sub["briefing_time"].partition(":")
@@ -1033,9 +1079,9 @@ async def check_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
                         now.date().isoformat(), now.date().isoformat()
                     )
                     lines = [gcal.format_event(e) for e in events] or ["Nichts eingetragen. 🎉"]
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=("📅 Deine Termine heute:\n" + "\n".join(lines))[:4000],
+                    await send_to(
+                        context, chat_id, thread_id,
+                        ("📅 Deine Termine heute:\n" + "\n".join(lines))[:4000],
                     )
                     await storage.mark_briefing_sent(chat_id, now.date())
 
@@ -1046,9 +1092,9 @@ async def check_calendar(context: ContextTypes.DEFAULT_TYPE) -> None:
                         continue  # ganztägige Termine haben keine sinnvolle Vorlaufzeit
                     uid = f"{event['id']}:{gcal.event_start(event).isoformat()}"
                     if await storage.mark_notified(chat_id, uid):
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"🔔 Gleich: {gcal.format_event(event)}"[:4000],
+                        await send_to(
+                            context, chat_id, thread_id,
+                            f"🔔 Gleich: {gcal.format_event(event)}"[:4000],
                         )
         except Exception:
             log.exception("Kalender-Benachrichtigung fehlgeschlagen (chat_id=%s)", chat_id)
@@ -1058,7 +1104,7 @@ async def check_proactive_suggestions(context: ContextTypes.DEFAULT_TYPE) -> Non
     """Läuft periodisch (JobQueue): prüft gebündelt unadressierte Gruppen-
     nachrichten der letzten Zeit und meldet sich nur, wenn wirklich etwas
     für Einkaufsliste/Erinnerungen/Notizen sinnvoll erscheint."""
-    for chat_id, buf in list(group_buffer.items()):
+    for (chat_id, thread_id), buf in list(group_buffer.items()):
         if not buf:
             continue
         messages = list(buf)
@@ -1099,7 +1145,7 @@ async def check_proactive_suggestions(context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if suggestion and suggestion.strip().upper() != "NONE":
             suggestion = suggestion[:4000]
-            await context.bot.send_message(chat_id=chat_id, text=suggestion)
+            await send_to(context, chat_id, thread_id, suggestion)
             # Im Verlauf merken, damit eine Antwort wie "ja mach" später
             # weiß, worauf sie sich bezieht.
             history[chat_id].append({"role": "assistant", "content": suggestion})

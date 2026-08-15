@@ -271,6 +271,25 @@ Mehrere Einträge kommagetrennt. In freigeschalteten Gruppen darf jedes
 Mitglied den Bot ansprechen — Gruppen also nur freischalten, wenn du allen
 Mitgliedern Zugriff auf Kalender und Liste geben willst.
 
+> **Achtung bei Supergruppen:** Wird eine normale Gruppe zur Supergruppe
+> hochgestuft (passiert z. B. beim Aktivieren von Themen), vergibt Telegram
+> eine **neue** Chat-ID mit `-100…`-Präfix. Die alte ID greift dann nicht mehr
+> und der Bot schweigt kommentarlos. Neue ID aus dem Log holen und
+> `ALLOWED_CHAT_IDS` aktualisieren — auch im Render-Dashboard.
+
+## Gruppen mit Themen (Forum)
+
+Hat eine Gruppe Themen aktiviert, antwortet der Bot immer im Thema, in dem er
+angesprochen wurde. Auch **zeitgesteuerte** Nachrichten landen dort, wo sie
+eingerichtet wurden: Erinnerungen merken sich das Thema beim Anlegen
+(`reminders.thread_id`), Kalender-Hinweise das Thema der letzten
+Abo-Einstellung (`calendar_subs.thread_id`). Proaktive Vorschläge werden pro
+Thema getrennt gesammelt und beantwortet.
+
+Ist ein Thema inzwischen gelöscht oder geschlossen, geht die Nachricht in den
+Hauptchat statt verloren. Einträge aus der Zeit vor diesem Feature haben
+`thread_id = NULL` und landen ebenfalls im Hauptchat.
+
 ## Sicherheit
 
 - **PDFs werden ohne Tool-Zugriff verarbeitet.** Sonst könnte ein präpariertes

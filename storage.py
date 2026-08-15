@@ -50,6 +50,11 @@ async def init_db() -> None:
         await conn.execute(
             "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS recent_outputs TEXT[] NOT NULL DEFAULT '{}'"
         )
+        # Forum-Gruppen: in welchem Thema wurde die Erinnerung angelegt?
+        # NULL = normale Gruppe/Privatchat oder Alt-Eintrag -> Hauptchat.
+        await conn.execute(
+            "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS thread_id BIGINT"
+        )
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS notes (
@@ -70,6 +75,9 @@ async def init_db() -> None:
                 last_briefing DATE
             )
             """
+        )
+        await conn.execute(
+            "ALTER TABLE calendar_subs ADD COLUMN IF NOT EXISTS thread_id BIGINT"
         )
         # Verhindert, dass derselbe Termin mehrfach angekündigt wird.
         await conn.execute(
@@ -132,16 +140,17 @@ def _format_recurrence(recurrence: str) -> str:
 
 
 async def create_reminder(
-    chat_id: int, text: str, due_at: str, recurrence: str = "once", kind: str = "text"
+    chat_id: int, text: str, due_at: str, recurrence: str = "once", kind: str = "text",
+    *, thread_id: int | None = None,
 ) -> str:
     recurrence = _normalize_recurrence(recurrence)
     kind = kind if kind in ("text", "vegan_recipe") else "text"
     due_utc = _to_utc(due_at)
     async with _pool.acquire() as conn:
         row_id = await conn.fetchval(
-            "INSERT INTO reminders (chat_id, text, due_at, recurrence, kind) "
-            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            chat_id, text, due_utc, recurrence, kind,
+            "INSERT INTO reminders (chat_id, text, due_at, recurrence, kind, thread_id) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            chat_id, text, due_utc, recurrence, kind, thread_id,
         )
     local = due_utc.astimezone(TZ)
     return f"Erinnerung #{row_id} gesetzt: '{text}' am {local.strftime('%Y-%m-%d %H:%M')}{_format_recurrence(recurrence)}."
@@ -207,7 +216,7 @@ async def due_reminders() -> list[dict]:
     """Alle über alle Chats fälligen Erinnerungen (für den periodischen Check)."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, chat_id, text, due_at, recurrence, kind, recent_outputs "
+            "SELECT id, chat_id, thread_id, text, due_at, recurrence, kind, recent_outputs "
             "FROM reminders WHERE due_at <= now()"
         )
     return [dict(row) for row in rows]
@@ -227,13 +236,18 @@ async def record_output(reminder_id: int, output_id: str, keep: int = 8) -> None
 
 
 async def set_calendar_notifications(
-    chat_id: int, briefing_time: str | None = None, lead_minutes: int | None = None
+    chat_id: int, briefing_time: str | None = None, lead_minutes: int | None = None,
+    *, thread_id: int | None = None,
 ) -> str:
     """Legt fest, wie dieser Chat über Kalendertermine informiert wird.
-    Nicht übergebene Werte bleiben unverändert, 0/'off' schaltet einzeln ab."""
+    Nicht übergebene Werte bleiben unverändert, 0/'off' schaltet einzeln ab.
+    Das Thema (thread_id) folgt immer dem zuletzt eingestellten."""
     async with _pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO calendar_subs (chat_id) VALUES ($1) ON CONFLICT DO NOTHING", chat_id
+        )
+        await conn.execute(
+            "UPDATE calendar_subs SET thread_id = $2 WHERE chat_id = $1", chat_id, thread_id
         )
         if briefing_time is not None:
             value = None if briefing_time.lower() in ("off", "aus", "") else briefing_time
@@ -265,8 +279,8 @@ async def set_calendar_notifications(
 async def calendar_subs() -> list[dict]:
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT chat_id, lead_minutes, briefing_time, last_briefing FROM calendar_subs "
-            "WHERE briefing_time IS NOT NULL OR lead_minutes IS NOT NULL"
+            "SELECT chat_id, thread_id, lead_minutes, briefing_time, last_briefing "
+            "FROM calendar_subs WHERE briefing_time IS NOT NULL OR lead_minutes IS NOT NULL"
         )
     return [dict(row) for row in rows]
 
