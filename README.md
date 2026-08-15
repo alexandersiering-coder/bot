@@ -48,6 +48,7 @@ Alles andere (normaler Text) geht ans Modell.
 | `PDF_MAX_CHARS`    | Max. Zeichen aus einer PDF ans Modell (Default 15000)              |
 | `DATABASE_URL`     | Optional, s. u. „Erinnerungen & Notizen"                          |
 | `TIMEZONE`         | Zeitzone für Erinnerungen (Default `Europe/Berlin`)                |
+| `RECIPE_API_KEY`   | Optional, s. u. „Vegane Rezeptvorschläge"                          |
 
 In Gruppen antwortet der Bot nur, wenn er per `@alesie_bot` erwähnt wird, auf
 seine eigene Nachricht geantwortet wird, oder `BOT_NAME_TRIGGER` im Text
@@ -107,6 +108,33 @@ GET auf die Basis-URL reicht (auch ein 404 zählt als „aufgeweckt").
 
 Ohne `DATABASE_URL` bleibt das Feature einfach aus, der Bot verhält sich wie
 zuvor.
+
+### Wochentag-genaue Wiederholung
+
+Für "3x die Woche" o. Ä. `recurrence='weekly:mon,wed,fri'` verwenden (Kürzel:
+`mon,tue,wed,thu,fri,sat,sun`, kommagetrennt). Das Modell setzt das
+automatisch, wenn du z. B. "erinnere mich montags, mittwochs und freitags an
+..." schreibst.
+
+### Vegane Rezeptvorschläge
+
+Wenn zusätzlich `RECIPE_API_KEY` gesetzt ist, kann der Bot wiederkehrend
+frische, gesunde vegane Rezepte vorschlagen (inkl. Zutatenliste und Link) —
+z. B. "erinnere mich montags, mittwochs und freitags an ein gesundes veganes
+Rezept". Das Modell setzt dafür `kind='vegan_recipe'` bei `create_reminder`;
+bei jeder Fälligkeit holt der Bot dann automatisch ein neues Rezept über die
+[Spoonacular-API](https://spoonacular.com/food-api), gefiltert nach
+`diet=vegan` und nach Gesundheitswert sortiert.
+
+**Wiederholungsvermeidung:** Pro Erinnerung merkt sich der Bot die letzten 8
+verschickten Rezept-IDs (`recent_outputs` in der DB) und schließt sie bei der
+nächsten Auswahl aus — dieselbe Erinnerung wiederholt sich also nicht.
+
+Kostenlosen Key holen: [spoonacular.com/food-api/console](https://spoonacular.com/food-api/console#Dashboard)
+(kein Kreditkarte nötig, kostenloser Tarif mit täglichem Punktelimit — für
+ein paar Rezepte pro Woche reichlich). Ohne `RECIPE_API_KEY` schlägt das
+Anlegen einer `vegan_recipe`-Erinnerung mit einer klaren Fehlermeldung fehl,
+der Rest des Bots bleibt unberührt.
 
 ## Bilder und PDFs
 

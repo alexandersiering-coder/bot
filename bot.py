@@ -25,9 +25,14 @@ from telegram.ext import (
     filters,
 )
 
-import storage
-
 load_dotenv()
+
+# Erst nach load_dotenv() importieren: beide lesen ihre Env-Vars (DATABASE_URL,
+# RECIPE_API_KEY) beim Import auf Modulebene, sonst sähen sie ggf. noch die
+# Umgebung von vor dem .env-Laden (betrifft lokale Entwicklung; auf Render
+# stehen die Vars ohnehin schon im Prozess-Environment).
+import recipes
+import storage
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ["LLM_API_KEY"]
@@ -92,9 +97,20 @@ if storage.REMINDERS_ENABLED:
         "als Telegram-Nachricht zum angegebenen Zeitpunkt geschickt. Rechne "
         "relative Zeitangaben ('morgen', 'in 2 Stunden', 'nächsten Montag') "
         "anhand des unten angegebenen aktuellen Datums in ein konkretes "
-        "ISO-Datetime um. Nutze die Functions direkt, wenn danach gefragt "
-        "wird, ohne extra nachzufragen."
+        "ISO-Datetime um. Für Wiederholungen an bestimmten Wochentagen (z. B. "
+        "'3x die Woche, Mo/Mi/Fr') nutze recurrence='weekly:mon,wed,fri' "
+        "(Kürzel: mon,tue,wed,thu,fri,sat,sun). Nutze die Functions direkt, "
+        "wenn danach gefragt wird, ohne extra nachzufragen."
     )
+    if recipes.RECIPES_ENABLED:
+        SYSTEM_PROMPT += (
+            "\n\nFür wiederkehrende Erinnerungen an gesunde vegane Rezepte "
+            "(z. B. '3x die Woche ein veganes Rezept') setze bei "
+            "create_reminder kind='vegan_recipe'. Der Bot holt dann bei "
+            "jeder Fälligkeit automatisch ein frisches Rezept von einer "
+            "Rezept-API (mit Zutatenliste), Wiederholungen werden vermieden "
+            "— 'text' dient dabei nur als kurze Beschriftung der Erinnerung."
+        )
 
 BRING_TOOLS = [
     {
@@ -216,8 +232,20 @@ REMINDER_TOOLS = [
                     },
                     "recurrence": {
                         "type": "string",
-                        "enum": ["once", "daily", "weekly"],
-                        "description": "Wiederholung der Erinnerung. Standard: once (einmalig).",
+                        "description": (
+                            "'once' (einmalig, Standard), 'daily' (täglich), oder "
+                            "'weekly:<tage>' für bestimmte Wochentage, z. B. "
+                            "'weekly:mon,wed,fri' (Kürzel: mon,tue,wed,thu,fri,sat,sun)."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["text", "vegan_recipe"],
+                        "description": (
+                            "'text' (Standard) verschickt 'text' wörtlich. "
+                            "'vegan_recipe' holt bei Fälligkeit automatisch ein "
+                            "frisches, gesundes veganes Rezept (nur wenn verfügbar)."
+                        ),
                     },
                 },
                 "required": ["text", "due_at"],
@@ -353,6 +381,8 @@ async def call_bring_tool(name: str, arguments: dict) -> str:
 
 async def call_reminder_tool(chat_id: int, name: str, arguments: dict) -> str:
     if name == "create_reminder":
+        if arguments.get("kind") == "vegan_recipe" and not recipes.RECIPES_ENABLED:
+            return "Fehler: Die Rezept-API ist nicht konfiguriert (RECIPE_API_KEY fehlt)."
         return await storage.create_reminder(chat_id, **arguments)
     if name == "list_reminders":
         return await storage.list_reminders(chat_id)
@@ -592,10 +622,20 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Läuft periodisch (JobQueue) und verschickt fällige Erinnerungen."""
     for row in await storage.due_reminders():
         try:
-            await context.bot.send_message(chat_id=row["chat_id"], text=f"⏰ {row['text']}")
+            text = row["text"]
+            if row["kind"] == "vegan_recipe" and recipes.RECIPES_ENABLED:
+                exclude_ids = set(row["recent_outputs"] or [])
+                recipe = await recipes.fetch_vegan_recipe(exclude_ids)
+                if recipe:
+                    text = recipes.format_recipe(recipe)
+                    await storage.record_output(row["id"], str(recipe["id"]))
+                else:
+                    text = f"{row['text']} (gerade kein Rezept gefunden, nächstes Mal wieder)"
+            # Telegram-Limit: 4096 Zeichen pro Nachricht
+            await context.bot.send_message(chat_id=row["chat_id"], text=f"⏰ {text}"[:4000])
         except Exception:
             log.exception("Erinnerung konnte nicht gesendet werden (chat_id=%s)", row["chat_id"])
-        await storage.reschedule_or_delete(row["id"], row["recurrence"])
+        await storage.reschedule_or_delete(row["id"], row["due_at"], row["recurrence"])
 
 
 async def _post_init(app: Application) -> None:

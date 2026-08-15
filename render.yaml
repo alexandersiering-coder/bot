@@ -36,3 +36,5 @@ services:
         sync: false
       - key: TIMEZONE
         value: Europe/Berlin
+      - key: RECIPE_API_KEY
+        sync: false

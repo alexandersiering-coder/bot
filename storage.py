@@ -5,7 +5,7 @@ genau wie die Bring-Anbindung ohne ihre Env-Vars.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -17,6 +17,9 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Berlin")
 TZ = ZoneInfo(TIMEZONE)
 
 _WEEKDAYS_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+# Reihenfolge entspricht datetime.weekday() (0=Montag ... 6=Sonntag).
+_WEEKDAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_WEEKDAY_LABELS = {"mon": "Mo", "tue": "Di", "wed": "Mi", "thu": "Do", "fri": "Fr", "sat": "Sa", "sun": "So"}
 
 _pool: asyncpg.Pool | None = None
 
@@ -38,6 +41,14 @@ async def init_db() -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
+        )
+        # Nachträglich hinzugekommene Spalten (idempotent, auch für die
+        # schon bestehende Tabelle in Neon).
+        await conn.execute(
+            "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'"
+        )
+        await conn.execute(
+            "ALTER TABLE reminders ADD COLUMN IF NOT EXISTS recent_outputs TEXT[] NOT NULL DEFAULT '{}'"
         )
         await conn.execute(
             """
@@ -73,24 +84,51 @@ def _to_utc(due_at: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-async def create_reminder(chat_id: int, text: str, due_at: str, recurrence: str = "once") -> str:
-    if recurrence not in ("once", "daily", "weekly"):
-        recurrence = "once"
+def _normalize_recurrence(recurrence: str) -> str:
+    """'once' / 'daily' / 'weekly:mon,wed,fri' (Kürzel s. _WEEKDAY_CODES).
+    Alles andere/Ungültige fällt auf 'once' zurück."""
+    recurrence = (recurrence or "once").strip().lower()
+    if recurrence in ("once", "daily"):
+        return recurrence
+    if recurrence.startswith("weekly:"):
+        given = {d.strip() for d in recurrence.removeprefix("weekly:").split(",")}
+        ordered = [d for d in _WEEKDAY_CODES if d in given]
+        if ordered:
+            return "weekly:" + ",".join(ordered)
+    return "once"
+
+
+def _format_recurrence(recurrence: str) -> str:
+    if recurrence == "once":
+        return ""
+    if recurrence == "daily":
+        return " (wiederholt: täglich)"
+    if recurrence.startswith("weekly:"):
+        labels = ", ".join(_WEEKDAY_LABELS.get(d, d) for d in recurrence.removeprefix("weekly:").split(","))
+        return f" (wiederholt: {labels})"
+    return ""
+
+
+async def create_reminder(
+    chat_id: int, text: str, due_at: str, recurrence: str = "once", kind: str = "text"
+) -> str:
+    recurrence = _normalize_recurrence(recurrence)
+    kind = kind if kind in ("text", "vegan_recipe") else "text"
     due_utc = _to_utc(due_at)
     async with _pool.acquire() as conn:
         row_id = await conn.fetchval(
-            "INSERT INTO reminders (chat_id, text, due_at, recurrence) "
-            "VALUES ($1, $2, $3, $4) RETURNING id",
-            chat_id, text, due_utc, recurrence,
+            "INSERT INTO reminders (chat_id, text, due_at, recurrence, kind) "
+            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            chat_id, text, due_utc, recurrence, kind,
         )
     local = due_utc.astimezone(TZ)
-    return f"Erinnerung #{row_id} gesetzt: '{text}' am {local.strftime('%Y-%m-%d %H:%M')} ({recurrence})."
+    return f"Erinnerung #{row_id} gesetzt: '{text}' am {local.strftime('%Y-%m-%d %H:%M')}{_format_recurrence(recurrence)}."
 
 
 async def list_reminders(chat_id: int) -> str:
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, text, due_at, recurrence FROM reminders "
+            "SELECT id, text, due_at, recurrence, kind FROM reminders "
             "WHERE chat_id = $1 ORDER BY due_at ASC",
             chat_id,
         )
@@ -99,8 +137,11 @@ async def list_reminders(chat_id: int) -> str:
     lines = []
     for row in rows:
         local = row["due_at"].astimezone(TZ)
-        suffix = f" (wiederholt: {row['recurrence']})" if row["recurrence"] != "once" else ""
-        lines.append(f"#{row['id']}: {row['text']} — {local.strftime('%Y-%m-%d %H:%M')}{suffix}")
+        kind_label = " [veganes Rezept]" if row["kind"] == "vegan_recipe" else ""
+        lines.append(
+            f"#{row['id']}: {row['text']}{kind_label} — "
+            f"{local.strftime('%Y-%m-%d %H:%M')}{_format_recurrence(row['recurrence'])}"
+        )
     return "\n".join(lines)
 
 
@@ -144,20 +185,40 @@ async def due_reminders() -> list[dict]:
     """Alle über alle Chats fälligen Erinnerungen (für den periodischen Check)."""
     async with _pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, chat_id, text, due_at, recurrence FROM reminders WHERE due_at <= now()"
+            "SELECT id, chat_id, text, due_at, recurrence, kind, recent_outputs "
+            "FROM reminders WHERE due_at <= now()"
         )
     return [dict(row) for row in rows]
 
 
-async def reschedule_or_delete(reminder_id: int, recurrence: str) -> None:
+async def record_output(reminder_id: int, output_id: str, keep: int = 8) -> None:
+    """Merkt sich zuletzt verschickte Inhalte (z. B. Rezept-IDs) pro Erinnerung,
+    damit sich wiederkehrende generierte Inhalte nicht wiederholen."""
+    async with _pool.acquire() as conn:
+        current = await conn.fetchval(
+            "SELECT recent_outputs FROM reminders WHERE id = $1", reminder_id
+        )
+        updated = ((current or []) + [output_id])[-keep:]
+        await conn.execute(
+            "UPDATE reminders SET recent_outputs = $2 WHERE id = $1", reminder_id, updated
+        )
+
+
+async def reschedule_or_delete(reminder_id: int, due_at: datetime, recurrence: str) -> None:
     async with _pool.acquire() as conn:
         if recurrence == "daily":
             await conn.execute(
                 "UPDATE reminders SET due_at = due_at + INTERVAL '1 day' WHERE id = $1", reminder_id
             )
-        elif recurrence == "weekly":
+        elif recurrence.startswith("weekly:"):
+            days = set(recurrence.removeprefix("weekly:").split(","))
+            next_due = due_at
+            for _ in range(7):
+                next_due += timedelta(days=1)
+                if _WEEKDAY_CODES[next_due.weekday()] in days:
+                    break
             await conn.execute(
-                "UPDATE reminders SET due_at = due_at + INTERVAL '7 days' WHERE id = $1", reminder_id
+                "UPDATE reminders SET due_at = $2 WHERE id = $1", reminder_id, next_due
             )
         else:
             await conn.execute("DELETE FROM reminders WHERE id = $1", reminder_id)
