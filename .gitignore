@@ -3,3 +3,9 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Claude-Sitzungsexporte: enthalten den kompletten Chatverlauf und
+# Anwendungslogs. Gehoeren nicht ins Repo - weder wegen der Groesse noch
+# wegen dessen, was in so einem Verlauf alles stehen kann. Dieses Repo
+# hat ein GitHub-Remote, ein versehentlicher Push waere nicht rueckholbar.
+session-export-*.zip
