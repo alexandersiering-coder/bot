@@ -28,7 +28,7 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
+load_dotenv(os.path.expanduser("~/.secrets/telegram-chatbot/.env"))
 
 # Erst nach load_dotenv() importieren: beide lesen ihre Env-Vars (DATABASE_URL,
 # RECIPE_API_KEY) beim Import auf Modulebene, sonst sähen sie ggf. noch die

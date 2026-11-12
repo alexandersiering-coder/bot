@@ -12,7 +12,7 @@ und `LLM_MODEL`.
 3. Starten:
 
 ```bash
-cd "/Users/alesie/Claude Projekte/telegram_chatbot" && ./.venv/bin/python bot.py
+cd "/Users/alesie/Claude Projekte/04_Claude-Tools/telegram-chatbot" && ./.venv/bin/python bot.py
 ```
 
 Beenden mit Strg+C. Danach in Telegram `@alesie_bot` anschreiben.
@@ -29,6 +29,10 @@ Beenden mit Strg+C. Danach in Telegram `@alesie_bot` anschreiben.
 Alles andere (normaler Text) geht ans Modell.
 
 ## Konfiguration (`.env`)
+
+Die `.env` liegt unter `~/.secrets/telegram-chatbot/.env`, nicht im Projektordner
+selbst (Zugangsdaten liegen grundsätzlich außerhalb der Projektordner). `bot.py` lädt sie von
+dort explizit über `load_dotenv(os.path.expanduser("~/.secrets/telegram-chatbot/.env"))`.
 
 | Variable           | Bedeutung                                                        |
 | ------------------ | ---------------------------------------------------------------- |
@@ -322,7 +326,7 @@ verfügbar ist — das setzt Render selbst, du musst nichts tun.
 1. Repo bei GitHub anlegen und pushen (Render deployt aus einem Git-Repo):
 
    ```bash
-   cd "/Users/alesie/Claude Projekte/telegram_chatbot"
+   cd "/Users/alesie/Claude Projekte/04_Claude-Tools/telegram-chatbot"
    git init && git add . && git commit -m "Initial commit"
    # dann auf GitHub ein leeres Repo anlegen und als Remote hinzufügen, z. B.:
    git remote add origin https://github.com/<dein-user>/<repo>.git
